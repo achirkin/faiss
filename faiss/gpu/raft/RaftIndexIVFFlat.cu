@@ -117,8 +117,16 @@ void RaftIndexIVFFlat::copyFrom(const faiss::IndexIVFFlat* index) {
             raft::copy(buf_dev.data(), buf_host.data(), total_elems, stream);
         }
 
-        RaftIndexIVFFlat::rebuildRaftIndex(buf_dev.data(), quantizer_ntotal);
-
+        // build an empty index (because we don't have a constructor that doesn't train).
+        RaftIndexIVFFlat::train(quantizer_ntotal, buf_dev.data());
+        // override centers
+        raft::copy(
+            this->raft_knn_index->centers().data_handle(),
+            _,
+            this->nlist * this->d,
+            stream
+        );
+        // add data
         if(index_ntotal > 0) {
             std::cout << "Adding " << index_ntotal << " vectors to index" << std::endl;
             total_elems = size_t(index_ntotal) * size_t(index->d);
@@ -128,7 +136,6 @@ void RaftIndexIVFFlat::copyFrom(const faiss::IndexIVFFlat* index) {
                 index->reconstruct_n(0, index->ntotal, buf_host.data());
                 raft::copy(buf_dev.data(), buf_host.data(), total_elems, stream);
             }
-
             RaftIndexIVFFlat::addImpl_(index_ntotal, buf_dev.data(), nullptr);
         }
     } else {
@@ -185,8 +192,18 @@ void RaftIndexIVFFlat::train(Index::idx_t n, const float* x) {
 
     raft::spatial::knn::ivf_flat::index_params raft_idx_params;
     raft_idx_params.n_lists = nlist;
-    raft_idx_params.metric = raft::distance::DistanceType::L2Expanded;
     raft_idx_params.add_data_on_build = false;
+    raft_idx_params.kmeans_trainset_fraction = 1.0;
+    switch (this->metric_type) {
+        case faiss::METRIC_L2:
+            raft_idx_params.metric = raft::distance::DistanceType::L2Expanded;
+            break;
+        case faiss::METRIC_INNER_PRODUCT:
+            raft_idx_params.metric = raft::distance::DistanceType::InnerProduct;
+            break;
+        default:
+            FAISS_THROW_MSG("Metric is not supported.");
+    }
 
     raft_knn_index.emplace(
         raft::spatial::knn::ivf_flat::build(raft_handle, raft_idx_params,
@@ -202,7 +219,7 @@ int RaftIndexIVFFlat::getListLength(int listId) const {
     DeviceScope scope(config_.device);
 
     uint32_t size;
-    raft::copy(&size, raft_knn_index.value().list_sizes().data_handle() + listId,
+    raft::copy(&size, raft_knn_index->list_sizes().data_handle() + listId,
                1, raft_handle.get_stream());
     raft_handle.sync_stream();
     return int(size);
@@ -216,22 +233,20 @@ std::vector<uint8_t> RaftIndexIVFFlat::getListVectorData(
 
     std::cout << "Calling getListVectorData for " << listId << std::endl;
 
-    using elem_t = decltype(raft_knn_index.value().data())::element_type;
-    size_t dim = raft_knn_index.value().dim();
+    using elem_t = decltype(raft_knn_index->data())::element_type;
+    size_t dim = raft_knn_index->dim();
     Index::idx_t offsets[2];
-    raft::copy(offsets, raft_knn_index.value().list_offsets().data_handle() + listId, 2, raft_handle.get_stream());
+    raft::copy(offsets, raft_knn_index->list_offsets().data_handle() + listId, 2, raft_handle.get_stream());
 
     raft_handle.sync_stream();
     size_t byte_offset = offsets[0] * sizeof(elem_t) * dim;
     // the interleaved block can be slightly larger than the list size (it's
     // rounded up)
-    size_t byte_size = size_t(offsets[1]) *
-                    sizeof(elem_t) * dim -
-            byte_offset;
+    size_t byte_size = size_t(offsets[1]) * sizeof(elem_t) * dim - byte_offset;
     std::vector<uint8_t> vec(byte_size);
     raft::copy(
             vec.data(),
-            reinterpret_cast<const uint8_t*>(raft_knn_index.value().data().data_handle()) +
+            reinterpret_cast<const uint8_t*>(raft_knn_index->data().data_handle()) +
                     byte_offset,
             byte_size,
             raft_handle.get_stream());
@@ -250,14 +265,14 @@ std::vector<Index::idx_t> RaftIndexIVFFlat::getListIndices(int listId) const {
     Index::idx_t offset;
     uint32_t size;
 
-    raft::copy(&offset, raft_knn_index.value().list_offsets().data_handle() + listId, 1, raft_handle.get_stream());
-    raft::copy(&size, raft_knn_index.value().list_sizes().data_handle() + listId, 1, raft_handle.get_stream());
+    raft::copy(&offset, raft_knn_index->list_offsets().data_handle() + listId, 1, raft_handle.get_stream());
+    raft::copy(&size, raft_knn_index->list_sizes().data_handle() + listId, 1, raft_handle.get_stream());
     raft_handle.sync_stream();
 
     std::vector<Index::idx_t> vec(size);
     raft::copy(
             vec.data(),
-            raft_knn_index.value().indices().data_handle() + offset,
+            raft_knn_index->indices().data_handle() + offset,
             size,
             raft_handle.get_stream());
     return vec;
@@ -278,9 +293,7 @@ void RaftIndexIVFFlat::addImpl_(
     // attempted to add
 
     std::cout << "Calling addImpl_ with " << n << " vectors." << std::endl;
-
-    raft_knn_index.emplace(raft::spatial::knn::ivf_flat::extend(
-            raft_handle, raft_knn_index.value(), x, xids, (Index::idx_t)n));
+    raft::spatial::knn::ivf_flat::extend(raft_handle, *raft_knn_index, x, xids, (Index::idx_t)n);
     this->ntotal += n;
 }
 
